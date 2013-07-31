@@ -67,17 +67,32 @@ unsigned get_radio_uid() {
   return ppwd->pw_uid;
 }
 
+int fork_zero_fucks() {
+    int pid = fork();
+    if (pid) {
+        int status;
+        waitpid(pid, &status, 0);
+        return pid;
+    }
+    else {
+        if (pid = fork())
+            exit(0);
+        return 0;
+    }
+}
+
 void exec_log(char *priority, char* logline) {
   int pid;
   if ((pid = fork()) == 0) {
-      int zero = open("/dev/zero", O_RDONLY | O_CLOEXEC);
       int null = open("/dev/null", O_WRONLY | O_CLOEXEC);
-      dup2(null, 0);
-      dup2(null, 1);
-      dup2(null, 2);
+      dup2(null, STDIN_FILENO);
+      dup2(null, STDOUT_FILENO);
+      dup2(null, STDERR_FILENO);
       execl("/system/bin/log", "/system/bin/log", "-p", priority, "-t", LOG_TAG, logline, NULL);
       _exit(0);
   }
+  int status;
+  waitpid(pid, &status, 0);
 }
 
 void exec_loge(const char* fmt, ...) {

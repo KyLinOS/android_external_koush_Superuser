@@ -287,11 +287,11 @@ static int daemon_accept(int fd) {
 done:
     write(fd, &code, sizeof(int));
     close(fd);
+    LOGD("child exited");
     return code;
 }
 
 int run_daemon() {
-    LOGD("starting su daemon");
     int fd;
     struct sockaddr_un sun;
 
@@ -299,6 +299,10 @@ int run_daemon() {
     if (fd < 0) {
         PLOGE("socket");
         return -1;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC)) {
+        PLOGE("fcntl FD_CLOEXEC");
+        goto err;
     }
 
     memset(&sun, 0, sizeof(sun));
@@ -333,9 +337,7 @@ int run_daemon() {
 
     int client;
     while ((client = accept(fd, NULL, NULL)) > 0) {
-        // dup/close?
-        LOGD("got client");
-        if (fork() == 0) {
+        if (fork_zero_fucks() == 0) {
             close(fd);
             return daemon_accept(client);
         }
@@ -367,6 +369,10 @@ int connect_daemon(int argc, char *argv[]) {
     int socketfd = socket(AF_LOCAL, SOCK_STREAM, 0);
     if (socketfd < 0) {
         PLOGE("socket");
+        exit(-1);
+    }
+    if (fcntl(socketfd, F_SETFD, FD_CLOEXEC)) {
+        PLOGE("fcntl FD_CLOEXEC");
         exit(-1);
     }
 

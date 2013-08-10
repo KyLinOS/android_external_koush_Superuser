@@ -102,7 +102,7 @@ defval:
  * whether the property with given prefix exists.
  *
  * Assume nobody is stupid enough to put a propery with prefix ro.mk.version
- * in his build.prop on a non-CM ROM and comment it out.
+ * in his build.prop on a non-KYLIN ROM and comment it out.
  */
 int check_property(const char *data, const char *prefix)
 {

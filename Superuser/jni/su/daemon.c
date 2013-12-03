@@ -15,6 +15,8 @@
 ** limitations under the License.
 */
 
+#define _GNU_SOURCE /* for unshare() */
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -29,11 +31,17 @@
 #include <getopt.h>
 #include <stdint.h>
 #include <pwd.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <sys/types.h>
 #include <pthread.h>
+#include <sched.h>
 #include <termios.h>
+
+#ifdef SUPERUSER_EMBEDEDED
+#include <cutils/multiuser.h>
+#endif
 
 #include "su.h"
 #include "utils.h"
@@ -90,6 +98,43 @@ static void write_string(int fd, char* val) {
     }
 }
 
+#ifdef SUPERUSER_EMBEDDED
+static void mount_emulated_storage(int user_id) {
+    const char *emulated_source = getenv("EMULATED_STORAGE_SOURCE");
+    const char *emulated_target = getenv("EMULATED_STORAGE_TARGET");
+    const char* legacy = getenv("EXTERNAL_STORAGE");
+
+    if (!emulated_source || !emulated_target) {
+        // No emulated storage is present
+        return;
+    }
+
+    // Create a second private mount namespace for our process
+    if (unshare(CLONE_NEWNS) < 0) {
+        PLOGE("unshare");
+        return;
+    }
+
+    if (mount("rootfs", "/", NULL, MS_SLAVE | MS_REC, NULL) < 0) {
+        PLOGE("mount rootfs as slave");
+        return;
+    }
+
+    // /mnt/shell/emulated -> /storage/emulated
+    if (mount(emulated_source, emulated_target, NULL, MS_BIND, NULL) < 0) {
+        PLOGE("mount emulated storage");
+    }
+
+    char target_user[PATH_MAX];
+    snprintf(target_user, PATH_MAX, "%s/%d", emulated_target, user_id);
+
+    // /mnt/shell/emulated/<user> -> /storage/emulated/legacy
+    if (mount(target_user, legacy, NULL, MS_BIND | MS_REC, NULL) < 0) {
+        PLOGE("mount legacy path");
+    }
+}
+#endif
+
 static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** argv) {
     if (-1 == dup2(outfd, STDOUT_FILENO)) {
         PLOGE("dup2 child outfd");
@@ -110,7 +155,7 @@ static int run_daemon_child(int infd, int outfd, int errfd, int argc, char** arg
     close(outfd);
     close(errfd);
 
-    return main(argc, argv);
+    return su_main(argc, argv, 0);
 }
 
 static void pump(int input, int output) {
@@ -170,6 +215,7 @@ static int daemon_accept(int fd) {
         daemon_from_pid = credentials.pid;
     }
 
+    int mount_storage = read_int(fd);
     int argc = read_int(fd);
     if (argc < 0 || argc > 512) {
         LOGE("unable to allocate args: %d", argc);
@@ -196,10 +242,13 @@ static int daemon_accept(int fd) {
     }
     if (mkfifo(errfile, 0660) != 0) {
         PLOGE("mkfifo %s", errfile);
+        unlink(outfile);
         exit(-1);
     }
     if (mkfifo(infile, 0660) != 0) {
         PLOGE("mkfifo %s", infile);
+        unlink(errfile);
+        unlink(outfile);
         exit(-1);
     }
 
@@ -219,11 +268,15 @@ static int daemon_accept(int fd) {
         ptm = open("/dev/ptmx", O_RDWR);
         if (ptm <= 0) {
             PLOGE("ptm");
-            exit(-1);
+            goto unlink_n_exit;
         }
         if(grantpt(ptm) || unlockpt(ptm) || ((devname = (char*) ptsname(ptm)) == 0)) {
             PLOGE("ptm setup");
             close(ptm);
+unlink_n_exit:
+            unlink(infile);
+            unlink(errfile);
+            unlink(outfile);
             exit(-1);
         }
         LOGD("devname: %s", devname);
@@ -232,18 +285,24 @@ static int daemon_accept(int fd) {
     int outfd = open(outfile, O_WRONLY);
     if (outfd <= 0) {
         PLOGE("outfd daemon %s", outfile);
-        goto done;
+        goto unlink_n_exit;
     }
     int errfd = open(errfile, O_WRONLY);
     if (errfd <= 0) {
         PLOGE("errfd daemon %s", errfile);
-        goto done;
+        goto unlink_n_exit;
     }
     int infd = open(infile, O_RDONLY);
     if (infd <= 0) {
         PLOGE("infd daemon %s", infile);
-        goto done;
+        goto unlink_n_exit;
     }
+
+    // Wait for client to open pipes, then remove
+    read_int(fd);
+    unlink(infile);
+    unlink(errfile);
+    unlink(outfile);
 
     int code;
     // now fork and run main, watch for the child pid exit, and send that
@@ -290,6 +349,12 @@ static int daemon_accept(int fd) {
             outfd = pts;
         }
 
+#ifdef SUPERUSER_EMBEDEDED
+        if (mount_storage) {
+            mount_emulated_storage(multiuser_get_user_id(daemon_from_uid));
+        }
+#endif
+
         return run_daemon_child(infd, outfd, errfd, argc, argv);
     }
 
@@ -309,7 +374,13 @@ static int daemon_accept(int fd) {
     int status;
     LOGD("waiting for child exit");
     if (waitpid(child, &status, 0) > 0) {
-        code = WEXITSTATUS(status);
+        if (WIFEXITED(status)) {
+            code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            code = 128 + WTERMSIG(status);
+        } else {
+            code = -1;
+        }
     }
     else {
         code = -1;
@@ -323,6 +394,11 @@ done:
 }
 
 int run_daemon() {
+    if (getuid() != 0 || getgid() != 0) {
+        PLOGE("daemon requires root. uid/gid not root");
+        return -1;
+    }
+
     int fd;
     struct sockaddr_un sun;
 
@@ -391,9 +467,6 @@ int connect_daemon(int argc, char *argv[]) {
     sprintf(outfile, "%s/%d.stdout", REQUESTOR_DAEMON_PATH, getpid());
     sprintf(errfile, "%s/%d.stderr", REQUESTOR_DAEMON_PATH, getpid());
     sprintf(infile, "%s/%d.stdin", REQUESTOR_DAEMON_PATH, getpid());
-    unlink(errfile);
-    unlink(infile);
-    unlink(outfile);
 
     struct sockaddr_un sun;
 
@@ -417,14 +490,21 @@ int connect_daemon(int argc, char *argv[]) {
     }
 
     LOGD("connecting client %d", getpid());
+
+    int mount_storage = getenv("MOUNT_EMULATED_STORAGE") != NULL;
+
     write_int(socketfd, getpid());
     write_int(socketfd, isatty(STDIN_FILENO));
     write_int(socketfd, uid);
     write_int(socketfd, getppid());
-    write_int(socketfd, argc);
+    write_int(socketfd, mount_storage);
+    write_int(socketfd, mount_storage ? argc - 1 : argc);
 
     int i;
     for (i = 0; i < argc; i++) {
+        if (i == 1 && mount_storage) {
+            continue;
+        }
         write_string(socketfd, argv[i]);
     }
 
@@ -447,11 +527,19 @@ int connect_daemon(int argc, char *argv[]) {
         exit(-1);
     }
 
+    // notify daemon that the pipes are open.
+    write_int(socketfd, 1);
+
     pump_async(STDIN_FILENO, infd);
     pump_async(errfd, STDERR_FILENO);
     pump(outfd, STDOUT_FILENO);
 
+    close(infd);
+    close(errfd);
+    close(outfd);
+
     int code = read_int(socketfd);
+    close(socketfd);
     LOGD("client exited %d", code);
     return code;
 }
